@@ -1,15 +1,15 @@
 """
 VLA inference runner — NO ROS 2 DEPENDENCY.
 
-Runs an Isaac-GR00T VLA policy against the Sonic whole-body control stack.
+Runs a pi05 VLA policy against the Sonic whole-body control stack.
 All communication uses ZMQ:
   1. Robot state  -> ZMQ SUB on ``g1_debug`` topic (from C++ zmq_output_handler)
   2. Actions out  -> ZMQ PUB (latent protocol v4: motion token + hand joints)
-  3. Camera       -> ZMQ/TCP via ComposedCameraClientSensor
+  3. Camera       -> ZMQ SUB via RealsenseZMQSubscriber (g1_camera_publisher.py :5620)
   4. Keyboard     -> ZMQ SUB via ZMQKeyboardSubscriber
 
-Uses the Isaac-GR00T PolicyClient (ZMQ REQ/REP) to communicate with a
-running PolicyServer.
+Uses Pi05Adapter (OmniRobot WebSocket client) to communicate with a running
+pi05 policy server (scripts/serve.py --transport websocket).
 
 Keyboard commands (received via ZMQ from the standalone keyboard publisher):
   p  -> pause / resume the policy loop
@@ -32,7 +32,6 @@ import numpy as np
 import tyro
 import zmq
 
-from gear_sonic.camera.composed_camera import ComposedCameraClientSensor
 from gear_sonic.data.robot_model.instantiation.g1 import instantiate_g1_robot_model
 from gear_sonic.utils.data_collection.keyboard_subscriber import (
     DEFAULT_ZMQ_KEYBOARD_PORT,
@@ -55,6 +54,87 @@ from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
     build_command_message,
     pack_pose_message,
 )
+
+
+class Pi05Adapter:
+    """OmniRobot pi05 WebSocket server behind GR00T's PolicyClient interface.
+
+    Bridges the two wire formats: takes the GR00T-shaped observation that
+    ``run_vla_inference`` builds and re-packages it into the flat
+    ``{images, states, text, embodiment_tag}`` obs the pi05 ``Policy.infer``
+    expects, then slices the flat 78-dim action back into the
+    ``motion_token`` / ``left_hand`` / ``right_hand`` keys the SONIC action
+    publisher consumes.
+    """
+
+    def __init__(self, host: str, port: int):
+        from gear_sonic.utils.inference.openpi_client.websocket_client_policy import (
+            WebsocketClientPolicy,
+        )
+
+        self.ws = WebsocketClientPolicy(host=host, port=port)
+
+    def ping(self) -> bool:
+        # WebsocketClientPolicy blocks in __init__ until the server is up.
+        return True
+
+    def get_action(self, obs: dict):
+        img = np.asarray(obs["video"]["ego_view"][0, 0], dtype=np.uint8)  # (H, W, 3)
+        state43 = np.asarray(obs["pi05_state43"], dtype=np.float32)       # (43,)
+        prompt = obs["language"]["annotation.human.task_description"][0][0]
+
+        out = self.ws.infer(
+            {
+                "images": {"ego_view": img},
+                "states": {"state": state43},
+                "text": prompt,
+                "embodiment_tag": "real_g1",
+            }
+        )
+        a = np.asarray(out["action"])  # (action_horizon, 78)
+        return {
+            "motion_token": a[:, :64],
+            "left_hand": a[:, 64:71],
+            "right_hand": a[:, 71:78],
+        }, {}
+
+
+class RealsenseZMQSubscriber:
+    """Reads frames from teleop_yiqi_robot/g1_camera_publisher.py.
+
+    Drop-in for ``ComposedCameraClientSensor``: exposes ``read()`` returning
+    ``{"images": {"ego_view": img}, "timestamps": {"ego_view": ts}}`` (or None
+    if no frame has arrived yet).
+
+    The robot publisher does ``sock.send_pyobj({"timestamp", "image"})`` on a
+    ZMQ PUB socket, where ``image`` is BGR (H, W, 3) uint8. We convert to RGB
+    because the pi05 image processor expects RGB.
+
+    NOTE: confirm the RGB/BGR convention matches how ``observation.images.
+    egocentric`` was stored when g1_pnp_pour_v3 was built — a silent swap here
+    degrades the policy with no error.
+    """
+
+    def __init__(self, host: str, port: int):
+        self._ctx = zmq.Context.instance()
+        self._sock = self._ctx.socket(zmq.SUB)
+        self._sock.setsockopt_string(zmq.SUBSCRIBE, "")
+        self._sock.setsockopt(zmq.CONFLATE, 1)  # keep only the freshest frame
+        self._sock.connect(f"tcp://{host}:{port}")
+        self._poller = zmq.Poller()
+        self._poller.register(self._sock, zmq.POLLIN)
+        print(f"[RealsenseZMQSubscriber] Connected to tcp://{host}:{port}")
+
+    def read(self):
+        if not self._poller.poll(timeout=0):  # non-blocking
+            return None
+        msg = self._sock.recv_pyobj()
+        bgr = np.asarray(msg["image"])          # (H, W, 3) BGR uint8
+        rgb = np.ascontiguousarray(bgr[:, :, ::-1])
+        return {
+            "images": {"ego_view": rgb},
+            "timestamps": {"ego_view": msg.get("timestamp", time.time())},
+        }
 
 
 @dataclass
@@ -80,10 +160,10 @@ class InferenceConfig:
 
     # Camera
     camera_host: str = "localhost"
-    """Camera server host."""
+    """Camera server host (the robot's IP running g1_camera_publisher.py)."""
 
-    camera_port: int = 5555
-    """Camera server port."""
+    camera_port: int = 5620
+    """Camera publisher port (g1_camera_publisher.py default)."""
 
     # ZMQ: Robot state (from C++ zmq_output_handler, g1_debug topic)
     state_zmq_host: str = "localhost"
@@ -272,6 +352,18 @@ def prepare_observation_from_sensors(
         projected_gravity, dtype=np.float32
     )[np.newaxis, np.newaxis]
 
+    # pi05 flat state (order per build_lerobot_v3.py: qpos(29)+lhand(7)+rhand(7)).
+    # Built from raw actuated readings — NOT the FK-expanded per-group state —
+    # to match exactly what the training dataset recorded. The left-hand
+    # index->middle copy above (state_msg["left_hand_q"][5,6]) is already applied.
+    observation["pi05_state43"] = np.concatenate(
+        [
+            np.asarray(state_msg["body_q"], dtype=np.float32),        # 29
+            np.asarray(state_msg["left_hand_q"], dtype=np.float32),   # 7
+            np.asarray(state_msg["right_hand_q"], dtype=np.float32),  # 7
+        ]
+    )
+
     return observation
 
 
@@ -367,10 +459,8 @@ def main(config: InferenceConfig):
 
     robot_model = instantiate_g1_robot_model(waist_location="lower_and_upper_body")
 
-    # Isaac-GR00T PolicyClient
-    from gr00t.policy.server_client import PolicyClient
-
-    n1_policy = PolicyClient(host=config.host, port=config.port)
+    # pi05 policy over OmniRobot WebSocket (replaces GR00T's ZMQ PolicyClient)
+    n1_policy = Pi05Adapter(host=config.host, port=config.port)
 
     print(f"Connecting to PolicyServer at {config.host}:{config.port}...")
     if n1_policy.ping():
@@ -383,8 +473,8 @@ def main(config: InferenceConfig):
         port=config.state_zmq_port,
     )
 
-    camera_subscriber = ComposedCameraClientSensor(
-        server_ip=config.camera_host, port=config.camera_port
+    camera_subscriber = RealsenseZMQSubscriber(
+        host=config.camera_host, port=config.camera_port
     )
 
     zmq_context = zmq.Context()
