@@ -165,6 +165,11 @@ class InferenceConfig:
     camera_port: int = 5620
     """Camera publisher port (g1_camera_publisher.py default)."""
 
+    sim: bool = False
+    """Running against MuJoCo sim: use ComposedCameraClientSensor (matches
+    the sim's SensorServer image protocol) instead of RealsenseZMQSubscriber
+    (matches the real robot's g1_camera_publisher.py pickle protocol)."""
+
     # ZMQ: Robot state (from C++ zmq_output_handler, g1_debug topic)
     state_zmq_host: str = "localhost"
     """ZMQ host for robot state (g1_debug topic from C++ deploy)."""
@@ -473,9 +478,16 @@ def main(config: InferenceConfig):
         port=config.state_zmq_port,
     )
 
-    camera_subscriber = RealsenseZMQSubscriber(
-        host=config.camera_host, port=config.camera_port
-    )
+    if config.sim:
+        from gear_sonic.camera.composed_camera import ComposedCameraClientSensor
+
+        camera_subscriber = ComposedCameraClientSensor(
+            server_ip=config.camera_host, port=config.camera_port
+        )
+    else:
+        camera_subscriber = RealsenseZMQSubscriber(
+            host=config.camera_host, port=config.camera_port
+        )
 
     zmq_context = zmq.Context()
     zmq_socket = zmq_context.socket(zmq.PUB)
@@ -783,11 +795,11 @@ def main(config: InferenceConfig):
                         dtype=np.float32,
                     )
                     left_hand_joints = np.asarray(
-                        get_action_field(processed_action, "left_hand_joints"),
+                        get_action_field(processed_action, "left_hand"),
                         dtype=np.float32,
                     )
                     right_hand_joints = np.asarray(
-                        get_action_field(processed_action, "right_hand_joints"),
+                        get_action_field(processed_action, "right_hand"),
                         dtype=np.float32,
                     )
 

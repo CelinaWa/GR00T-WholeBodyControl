@@ -385,6 +385,7 @@ def main(config: InferenceLaunchConfig):
         f"--action-horizon {config.action_horizon} "
         f"--camera-host {config.camera_host} "
         f"--camera-port {config.camera_port}"
+        f"{' --sim' if config.sim else ''}"
     )
 
     print("Starting VLA inference (pane 1)...")
