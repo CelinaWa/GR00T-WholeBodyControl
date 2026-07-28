@@ -690,7 +690,16 @@ def main(config: InferenceConfig):
             if pause_loop:
                 print("Policy loop paused (C++ loop still running - press 'k' to stop)")
             else:
-                print("Policy loop resumed")
+                # Discard any chunk computed while paused: its observation may
+                # predate an 'i' init-pose move, so its actions belong to a pose
+                # the robot is no longer in — executing it causes a sudden large
+                # first motion. Clearing forces an immediate fresh inference from
+                # the CURRENT pose (the deploy holds the last token for the
+                # ~0.4 s this takes). Observed on hardware 2026-07-28.
+                cached_action_chunk = None
+                action_chunk_index = 0
+                print("Policy loop resumed - cleared stale chunk, inferring fresh "
+                      "from current pose (brief hold)")
         elif key == "k":
             if cpp_loop_running:
                 current_planner = cpp_mode == "PLANNER"
