@@ -67,12 +67,13 @@ class Pi05Adapter:
     publisher consumes.
     """
 
-    def __init__(self, host: str, port: int):
+    def __init__(self, host: str, port: int, embodiment_tag: str = "real_g1"):
         from gear_sonic.utils.inference.openpi_client.websocket_client_policy import (
             WebsocketClientPolicy,
         )
 
         self.ws = WebsocketClientPolicy(host=host, port=port)
+        self.embodiment_tag = embodiment_tag
 
     def ping(self) -> bool:
         # WebsocketClientPolicy blocks in __init__ until the server is up.
@@ -88,7 +89,7 @@ class Pi05Adapter:
                 "images": {"ego_view": img},
                 "states": {"state": state43},
                 "text": prompt,
-                "embodiment_tag": "real_g1",
+                "embodiment_tag": self.embodiment_tag,
             }
         )
         a = np.asarray(out["action"])  # (action_horizon, 78)
@@ -192,8 +193,11 @@ class InferenceConfig:
     """ZMQ port for keyboard input."""
 
     # Embodiment
-    embodiment_tag: str = "unitree_g1_sonic"
-    """Embodiment tag for policy inference."""
+    embodiment_tag: str = "real_g1"
+    """Embodiment tag sent to the pi05 policy server — must match the tag the
+    server was started with (serve.py --embodiment). Default preserves the
+    previous behavior (the adapter used to hardcode "real_g1" and ignore this
+    flag); pass it explicitly to serve a differently-tagged checkpoint."""
 
     # Prompt / eval
     prompt: str = "demo"
@@ -358,14 +362,19 @@ def prepare_observation_from_sensors(
     )[np.newaxis, np.newaxis]
 
     # pi05 flat state (order per build_lerobot_v3.py: qpos(29)+lhand(7)+rhand(7)).
-    # Built from raw actuated readings — NOT the FK-expanded per-group state —
-    # to match exactly what the training dataset recorded. The left-hand
-    # index->middle copy above (state_msg["left_hand_q"][5,6]) is already applied.
+    # Hand dims use the COMMANDED values (last_*_hand_action), NOT the measured
+    # left/right_hand_q: the training datasets' state-hands are bit-identical to
+    # the action-hands (verified on g1_pnp/pour_v3 parquets 2026-07-28) because
+    # the recording pipeline stores last_*_hand_action for both. Measured hand_q
+    # diverges from commanded exactly during grasps (fingers blocked by the
+    # object), which would feed the policy an out-of-distribution state at the
+    # manipulation-critical moments. (The index->middle copy above only affects
+    # the measured hand_q used for the GR00T FK fields, not this state.)
     observation["pi05_state43"] = np.concatenate(
         [
-            np.asarray(state_msg["body_q"], dtype=np.float32),        # 29
-            np.asarray(state_msg["left_hand_q"], dtype=np.float32),   # 7
-            np.asarray(state_msg["right_hand_q"], dtype=np.float32),  # 7
+            np.asarray(state_msg["body_q"], dtype=np.float32),              # 29
+            np.asarray(state_msg["last_left_hand_action"], dtype=np.float32),   # 7 (commanded)
+            np.asarray(state_msg["last_right_hand_action"], dtype=np.float32),  # 7 (commanded)
         ]
     )
 
@@ -465,7 +474,9 @@ def main(config: InferenceConfig):
     robot_model = instantiate_g1_robot_model(waist_location="lower_and_upper_body")
 
     # pi05 policy over OmniRobot WebSocket (replaces GR00T's ZMQ PolicyClient)
-    n1_policy = Pi05Adapter(host=config.host, port=config.port)
+    n1_policy = Pi05Adapter(
+        host=config.host, port=config.port, embodiment_tag=config.embodiment_tag
+    )
 
     print(f"Connecting to PolicyServer at {config.host}:{config.port}...")
     if n1_policy.ping():
