@@ -35,7 +35,12 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
             try:
                 headers = {"Authorization": f"Api-Key {self._api_key}"} if self._api_key else None
                 conn = websockets.sync.client.connect(
-                    self._uri, compression=None, max_size=None, additional_headers=headers
+                    self._uri, compression=None, max_size=None, additional_headers=headers,
+                    # The server runs infer synchronously; a cold first call (torch.compile
+                    # max-autotune) can block for minutes, and the default 20 s keepalive
+                    # would drop the connection with 1011 (OmniRobot fix 6ac332b).
+                    ping_interval=None,
+                    open_timeout=None,
                 )
                 metadata = msgpack_numpy.unpackb(conn.recv())
                 return conn, metadata

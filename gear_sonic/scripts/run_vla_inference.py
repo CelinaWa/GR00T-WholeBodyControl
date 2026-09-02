@@ -1,15 +1,16 @@
 """
 VLA inference runner — NO ROS 2 DEPENDENCY.
 
-Runs a pi05 VLA policy against the Sonic whole-body control stack.
+Runs a VLA policy served by OmniRobot (pi05, GR00T-N1.5, qwenpi, ...) against the Sonic whole-body control stack.
 All communication uses ZMQ:
   1. Robot state  -> ZMQ SUB on ``g1_debug`` topic (from C++ zmq_output_handler)
   2. Actions out  -> ZMQ PUB (latent protocol v4: motion token + hand joints)
   3. Camera       -> ZMQ SUB via RealsenseZMQSubscriber (g1_camera_publisher.py :5620)
   4. Keyboard     -> ZMQ SUB via ZMQKeyboardSubscriber
 
-Uses Pi05Adapter (OmniRobot WebSocket client) to communicate with a running
-pi05 policy server (scripts/serve.py --transport websocket).
+Uses OmniRobotAdapter (OmniRobot WebSocket client) to communicate with a running
+OmniRobot policy server (scripts/serve.py --transport websocket); the model behind it is
+selected by the server, and the client adapts to it via the metadata handshake.
 
 Keyboard commands (received via ZMQ from the standalone keyboard publisher):
   p  -> pause / resume the policy loop
@@ -26,6 +27,7 @@ Keyboard commands (received via ZMQ from the standalone keyboard publisher):
 from dataclasses import dataclass
 import queue
 import threading
+from collections import deque
 import time
 
 import numpy as np
@@ -56,12 +58,17 @@ from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
 )
 
 
-class Pi05Adapter:
-    """OmniRobot pi05 WebSocket server behind GR00T's PolicyClient interface.
+class OmniRobotAdapter:
+    """OmniRobot WebSocket policy server behind GR00T's PolicyClient interface.
+
+    Model-agnostic: every checkpoint served by OmniRobot (pi05, GR00T-N1.5,
+    qwenpi, ...) speaks the same wire format, and the per-model differences
+    (action chunk length, image-history depth/stride) are read from the server's
+    metadata handshake below rather than hardcoded here.
 
     Bridges the two wire formats: takes the GR00T-shaped observation that
     ``run_vla_inference`` builds and re-packages it into the flat
-    ``{images, states, text, embodiment_tag}`` obs the pi05 ``Policy.infer``
+    ``{images, states, text, embodiment_tag}`` obs the OmniRobot ``Policy.infer``
     expects, then slices the flat 78-dim action back into the
     ``motion_token`` / ``left_hand`` / ``right_hand`` keys the SONIC action
     publisher consumes.
@@ -75,18 +82,43 @@ class Pi05Adapter:
         self.ws = WebsocketClientPolicy(host=host, port=port)
         self.embodiment_tag = embodiment_tag
 
+        # Server contract from the metadata handshake (OmniRobot Policy.server_metadata):
+        #  - video_history: models trained with img_history_size H > 1 expect a stack of
+        #    H frames per camera at temporal stride S env-steps (dataset fps), oldest ->
+        #    newest; a single frame puts them out of distribution (e.g. qwenpi: 3 @ 10).
+        #  - action_horizon: the chunk length the server returns; --action-horizon MUST
+        #    match it (the client indexes/clamps by it).
+        md = self.ws.get_server_metadata() or {}
+        vh = md.get("video_history") or {}
+        self.history_frames = int(vh.get("frames", 1) or 1)
+        self.history_stride_steps = int(vh.get("stride_steps", 1) or 1)
+        self.server_action_horizon = None
+        embs = md.get("embodiments") or {}
+        for _tag, entry in embs.items():
+            if isinstance(entry, dict) and "action_horizon" in entry:
+                self.server_action_horizon = int(entry["action_horizon"])
+                break
+        print_green(
+            f"Policy server metadata: action_horizon={self.server_action_horizon}, "
+            f"video_history={self.history_frames} frame(s) @ stride {self.history_stride_steps} step(s)"
+        )
+
     def ping(self) -> bool:
         # WebsocketClientPolicy blocks in __init__ until the server is up.
         return True
 
     def get_action(self, obs: dict):
         img = np.asarray(obs["video"]["ego_view"][0, 0], dtype=np.uint8)  # (H, W, 3)
+        # Frame history (T, H, W, 3), oldest -> newest, provided by the camera
+        # subscriber when the server asked for it; otherwise the single frame.
+        hist = (obs.get("video_history") or {}).get("ego_view")
+        images = np.asarray(hist, dtype=np.uint8) if hist is not None else img
         state43 = np.asarray(obs["pi05_state43"], dtype=np.float32)       # (43,)
         prompt = obs["language"]["annotation.human.task_description"][0][0]
 
         out = self.ws.infer(
             {
-                "images": {"ego_view": img},
+                "images": {"ego_view": images},
                 "states": {"state": state43},
                 "text": prompt,
                 "embodiment_tag": self.embodiment_tag,
@@ -116,7 +148,7 @@ class RealsenseZMQSubscriber:
     degrades the policy with no error.
     """
 
-    def __init__(self, host: str, port: int):
+    def __init__(self, host: str, port: int, history_frames: int = 1, history_stride_s: float = 0.0):
         self._ctx = zmq.Context.instance()
         self._sock = self._ctx.socket(zmq.SUB)
         self._sock.setsockopt_string(zmq.SUBSCRIBE, "")
@@ -126,15 +158,74 @@ class RealsenseZMQSubscriber:
         self._poller.register(self._sock, zmq.POLLIN)
         print(f"[RealsenseZMQSubscriber] Connected to tcp://{host}:{port}")
 
-    def read(self):
-        if not self._poller.poll(timeout=0):  # non-blocking
-            return None
+        # Optional frame history (server metadata video_history): keep a ring buffer
+        # of recent frames via a capture thread, so read() can return a (T, H, W, 3)
+        # stack at offsets [-(T-1)*S, ..., -S, 0] seconds regardless of how rarely
+        # the inference worker polls us. T == 1 keeps the legacy single-frame path.
+        self._hist_n = max(1, int(history_frames))
+        self._hist_stride_s = float(history_stride_s)
+        self._buf: deque = deque()
+        self._lock = threading.Lock()
+        if self._hist_n > 1:
+            keep_s = (self._hist_n - 1) * self._hist_stride_s + 1.0
+            self._keep_s = keep_s
+            t = threading.Thread(target=self._capture_loop, daemon=True)
+            t.start()
+            print(
+                f"[RealsenseZMQSubscriber] frame history: {self._hist_n} frames @ "
+                f"{self._hist_stride_s:.2f}s stride (buffer {keep_s:.1f}s)"
+            )
+
+    def _recv_frame(self):
         msg = self._sock.recv_pyobj()
         bgr = np.asarray(msg["image"])          # (H, W, 3) BGR uint8
         rgb = np.ascontiguousarray(bgr[:, :, ::-1])
+        return msg.get("timestamp", time.time()), rgb
+
+    def _capture_loop(self):
+        while True:
+            if not self._poller.poll(timeout=100):
+                continue
+            ts, rgb = self._recv_frame()
+            now = time.time()
+            with self._lock:
+                self._buf.append((ts, rgb))
+                while self._buf and now - self._buf[0][0] > self._keep_s:
+                    self._buf.popleft()
+
+    def _history_stack(self):
+        """(T, H, W, 3) oldest->newest, nearest buffered frame to each target time,
+        clamped to the oldest frame at start-up (mirrors the training loader)."""
+        with self._lock:
+            frames = list(self._buf)
+        if not frames:
+            return None
+        t_now = frames[-1][0]
+        ts = np.array([f[0] for f in frames])
+        stack = []
+        for k in range(self._hist_n - 1, -1, -1):
+            target = t_now - k * self._hist_stride_s
+            idx = int(np.argmin(np.abs(ts - target)))
+            stack.append(frames[idx][1])
+        return t_now, frames[-1][1], np.stack(stack)
+
+    def read(self):
+        if self._hist_n > 1:
+            h = self._history_stack()
+            if h is None:
+                return None
+            ts, rgb, stack = h
+            return {
+                "images": {"ego_view": rgb},
+                "history": {"ego_view": stack},
+                "timestamps": {"ego_view": ts},
+            }
+        if not self._poller.poll(timeout=0):  # non-blocking
+            return None
+        ts, rgb = self._recv_frame()
         return {
             "images": {"ego_view": rgb},
-            "timestamps": {"ego_view": msg.get("timestamp", time.time())},
+            "timestamps": {"ego_view": ts},
         }
 
 
@@ -352,6 +443,11 @@ def prepare_observation_from_sensors(
 
     observation = prepare_observation_for_eval(robot_model, observation)
 
+    # Frame history stack for servers that ask for it (see OmniRobotAdapter); kept out
+    # of observation["video"] so prepare_observation_for_eval sees a single frame.
+    if camera_msg.get("history"):
+        observation["video_history"] = dict(camera_msg["history"])
+
     # Projected gravity for Sonic latent embodiment
     assert "base_quat" in state_msg, "base_quat not found in state_msg"
     base_quat = np.asarray(state_msg["base_quat"], dtype=np.float64)
@@ -474,7 +570,7 @@ def main(config: InferenceConfig):
     robot_model = instantiate_g1_robot_model(waist_location="lower_and_upper_body")
 
     # pi05 policy over OmniRobot WebSocket (replaces GR00T's ZMQ PolicyClient)
-    n1_policy = Pi05Adapter(
+    n1_policy = OmniRobotAdapter(
         host=config.host, port=config.port, embodiment_tag=config.embodiment_tag
     )
 
@@ -483,6 +579,20 @@ def main(config: InferenceConfig):
         print_green("PolicyServer is reachable.")
     else:
         print("WARNING: PolicyServer not reachable. Inference will fail until server is up.")
+
+    if (
+        n1_policy.server_action_horizon is not None
+        and n1_policy.server_action_horizon != config.action_horizon
+    ):
+        raise SystemExit(
+            f"--action-horizon {config.action_horizon} does not match the policy server's "
+            f"chunk length {n1_policy.server_action_horizon}. Pass "
+            f"--action-horizon {n1_policy.server_action_horizon} (and recompute --rate: "
+            f"quasi-sync = 1/((H-4)/{config.action_publish_rate} - 0.4))."
+        )
+    # Frame-history stride is given in env steps at the dataset fps, which is the
+    # action publish rate (10 Hz for the G1 datasets).
+    history_stride_s = n1_policy.history_stride_steps / float(config.action_publish_rate)
 
     state_subscriber = ZMQStateSubscriber(
         host=config.state_zmq_host,
@@ -495,9 +605,17 @@ def main(config: InferenceConfig):
         camera_subscriber = ComposedCameraClientSensor(
             server_ip=config.camera_host, port=config.camera_port
         )
+        if n1_policy.history_frames > 1:
+            print(
+                f"WARNING: server expects {n1_policy.history_frames}-frame history but the "
+                "sim camera sends single frames -- policy runs out of distribution."
+            )
     else:
         camera_subscriber = RealsenseZMQSubscriber(
-            host=config.camera_host, port=config.camera_port
+            host=config.camera_host,
+            port=config.camera_port,
+            history_frames=n1_policy.history_frames,
+            history_stride_s=history_stride_s,
         )
 
     zmq_context = zmq.Context()
