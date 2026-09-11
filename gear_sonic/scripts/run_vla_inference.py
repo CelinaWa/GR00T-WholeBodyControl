@@ -300,6 +300,19 @@ class InferenceConfig:
     blends from its current motion token to the initial pose token over this
     period. Set to 0 to snap instantly (no blend)."""
 
+    # Chunk handoff
+    execution: str = "async"
+    """Chunk handoff style: "async" or "sync".
+    async (GR00T default): re-infer on a timer (`--rate`, counted from chunk
+    ARRIVAL) and enter the new chunk at the latency-compensated index, so
+    chunks overlap and the current one is replaced mid-way (a jump at the seam).
+    sync: query only on the tick that sends the current chunk's LAST action,
+    hold that action while the server thinks (~inference latency), then start
+    the new chunk at index 0. Every action of every chunk is executed and the
+    robot pauses ~latency at each boundary; `--rate` is ignored. Matches the
+    offline evaluator / Dexmate live driver. The hold-last keeps the WBC fed at
+    the publish rate, but validate in sim before the real robot."""
+
     # Debug
     verbose_timing: bool = False
     """Whether to always print timing info (not just when loop is slow)."""
@@ -746,7 +759,21 @@ def main(config: InferenceConfig):
             print(f"Warning: Failed to send {action_str} command message: {e}")
             return False
 
-    # Async inference state
+    if config.execution not in ("async", "sync"):
+        raise SystemExit(f"--execution must be 'async' or 'sync', got {config.execution!r}")
+    sync_execution = config.execution == "sync"
+    if sync_execution:
+        print_green(
+            "Execution: SYNC — re-infer when the chunk is exhausted, hold the last "
+            "action during inference, start each chunk at index 0 (--rate ignored)."
+        )
+    else:
+        print_green(
+            f"Execution: ASYNC — re-infer every {1.0 / config.rate:.2f}s after chunk "
+            "arrival, enter at the latency-compensated index."
+        )
+
+    # Inference state
     cached_action_chunk = None
     action_chunk_index = 0
     last_inference_time = 0.0
@@ -885,9 +912,14 @@ def main(config: InferenceConfig):
             try:
                 processed_action, inference_start_time = result_queue.get_nowait()
                 inference_delay = time.monotonic() - inference_start_time
-                action_chunk_index = calculate_latency_compensated_index(
-                    inference_delay, config.action_publish_rate, config.action_horizon
-                )
+                if sync_execution:
+                    # The robot held still while the server thought, so the
+                    # observation is still current: use the chunk from index 0.
+                    action_chunk_index = 0
+                else:
+                    action_chunk_index = calculate_latency_compensated_index(
+                        inference_delay, config.action_publish_rate, config.action_horizon
+                    )
                 cached_action_chunk = processed_action
                 last_inference_time = time.monotonic()
                 print_green(
@@ -898,12 +930,27 @@ def main(config: InferenceConfig):
                 pass
 
             worker_is_busy = inference_busy_event.is_set()
-            should_start = should_trigger_new_inference(
-                cached_chunk_exists=(cached_action_chunk is not None),
-                inference_thread_running=worker_is_busy,
-                time_since_last_inference=(time.monotonic() - last_inference_time),
-                inference_interval=inference_interval,
-            )
+            if sync_execution:
+                # Query on the tick that sends the chunk's last action (or when
+                # nothing is cached). While the server thinks, the clamp below
+                # keeps re-sending that last action. `result_queue.empty()`
+                # closes the race where the worker finished after this tick's
+                # consume step: without it we would query twice.
+                should_start = (
+                    (not worker_is_busy)
+                    and result_queue.empty()
+                    and (
+                        cached_action_chunk is None
+                        or action_chunk_index >= config.action_horizon - 1
+                    )
+                )
+            else:
+                should_start = should_trigger_new_inference(
+                    cached_chunk_exists=(cached_action_chunk is not None),
+                    inference_thread_running=worker_is_busy,
+                    time_since_last_inference=(time.monotonic() - last_inference_time),
+                    inference_interval=inference_interval,
+                )
 
             if should_start:
                 try:
