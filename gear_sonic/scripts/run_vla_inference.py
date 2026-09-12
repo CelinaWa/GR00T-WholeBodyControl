@@ -300,6 +300,16 @@ class InferenceConfig:
     blends from its current motion token to the initial pose token over this
     period. Set to 0 to snap instantly (no blend)."""
 
+    init_episode: str = ""
+    """Optional path to a recorded episode; if set, 'i' inits to that episode's
+    FIRST motion token instead of the generic LATENT_INITIAL_MOTION_TOKEN — an
+    in-distribution start pose that matches the checkpoint's training data.
+    Accepts an aligned npz (data/g1/staging/<task>/aligned/episode_N.npz, key
+    'motion_token') or a token npz (tokens_episode_N.npz, key 'token_state').
+    Empty = the default standing pose. NOTE: the token lives in the SONIC
+    decoder's latent space, so use an episode recorded with the SAME SONIC deploy
+    you are running (hands still follow the '['/']' toggles)."""
+
     # Chunk handoff
     execution: str = "async"
     """Chunk handoff style: "async" or "sync".
@@ -577,6 +587,24 @@ def _compute_closed_hand_joints(side: str) -> np.ndarray:
     return solver._get_middle_close_q_desired().astype(np.float32)
 
 
+def _load_init_token_from_episode(path: str) -> np.ndarray:
+    """Return a recorded episode's FIRST motion token [64], for use as the init
+    pose (see InferenceConfig.init_episode). Accepts an aligned npz (key
+    'motion_token', from data_pipeline/g1/align_episode.py) or a token npz (key
+    'token_state', from the PC recorder). Fails loud on a bad file/shape."""
+    d = np.load(path)
+    key = "motion_token" if "motion_token" in d else ("token_state" if "token_state" in d else None)
+    if key is None:
+        raise SystemExit(
+            f"--init-episode {path!r}: no 'motion_token' or 'token_state' key "
+            f"(found {list(d.keys())}). Pass an aligned episode npz or a tokens_episode_N.npz."
+        )
+    tok = np.asarray(d[key], dtype=np.float32)
+    if tok.ndim != 2 or tok.shape[1] != 64:
+        raise SystemExit(f"--init-episode {path!r}: expected (T, 64) tokens, got {tok.shape}.")
+    return tok[0].copy()  # the episode's first-frame motion token
+
+
 def main(config: InferenceConfig):
     pause_loop = True
 
@@ -657,6 +685,14 @@ def main(config: InferenceConfig):
     initial_pose_left_hand_closed = False
     initial_pose_right_hand_closed = False
 
+    # Init-pose target token: a recorded episode's first frame (in-distribution
+    # warm start) or the generic standing pose. Resolved once at startup.
+    if config.init_episode:
+        init_motion_token = _load_init_token_from_episode(config.init_episode)
+        print_green(f"Init pose: first motion token from episode {config.init_episode}")
+    else:
+        init_motion_token = LATENT_INITIAL_MOTION_TOKEN
+
     def publish_initial_pose():
         """Publish initial pose command to move robot to starting position."""
         print("Moving to initial pose")
@@ -671,7 +707,7 @@ def main(config: InferenceConfig):
             else np.zeros(7, dtype=np.float32)
         )
         zmq_message = pack_latent_action_message(
-            motion_token=LATENT_INITIAL_MOTION_TOKEN,
+            motion_token=init_motion_token,
             frame_index=np.array([0], dtype=np.int64),
             left_hand_joints=left_hand,
             right_hand_joints=right_hand,
@@ -695,7 +731,7 @@ def main(config: InferenceConfig):
             return False
 
         start_token = last_sent_motion_token.copy()
-        target_token = LATENT_INITIAL_MOTION_TOKEN.copy()
+        target_token = np.asarray(init_motion_token, dtype=np.float32).copy()
         num_steps = max(1, round(config.action_publish_rate * duration_s))
         step_period = 1.0 / config.action_publish_rate
 
