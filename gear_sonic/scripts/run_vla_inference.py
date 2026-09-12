@@ -98,8 +98,16 @@ class OmniRobotAdapter:
             if isinstance(entry, dict) and "action_horizon" in entry:
                 self.server_action_horizon = int(entry["action_horizon"])
                 break
+        # Some policies PREDICT a long chunk but are meant to be re-queried sooner:
+        # the server advertises how many actions to execute before replanning under
+        # control.replan_after_actions (== execute_horizon). None = execute the full
+        # chunk. Sync execution honors this (see --execute-horizon).
+        ctrl = md.get("control") or {}
+        reh = ctrl.get("replan_after_actions", ctrl.get("execute_horizon"))
+        self.server_execute_horizon = int(reh) if reh else None
         print_green(
             f"Policy server metadata: action_horizon={self.server_action_horizon}, "
+            f"replan_after_actions={self.server_execute_horizon}, "
             f"video_history={self.history_frames} frame(s) @ stride {self.history_stride_steps} step(s)"
         )
 
@@ -322,6 +330,14 @@ class InferenceConfig:
     robot pauses ~latency at each boundary; `--rate` is ignored. Matches the
     offline evaluator / Dexmate live driver. The hold-last keeps the WBC fed at
     the publish rate, but validate in sim before the real robot."""
+
+    execute_horizon: int = 0
+    """SYNC only: execute this many actions of each chunk before replanning, for a
+    policy that PREDICTS a long chunk but is meant to be re-queried sooner (e.g.
+    predict 32, execute 16). 0 = use the server's advertised replan_after_actions
+    if any, else the full action_horizon. Must be 1..action_horizon. Ignored in
+    async (use `--rate` there). --action-horizon still matches the FULL chunk the
+    server returns."""
 
     # Debug
     verbose_timing: bool = False
@@ -798,10 +814,23 @@ def main(config: InferenceConfig):
     if config.execution not in ("async", "sync"):
         raise SystemExit(f"--execution must be 'async' or 'sync', got {config.execution!r}")
     sync_execution = config.execution == "sync"
+    # How many actions of each chunk sync executes before replanning. Priority:
+    # explicit --execute-horizon, else the server's advertised replan_after_actions,
+    # else the full chunk. Clamped to 1..action_horizon. async always uses the full
+    # chunk (its cadence is --rate), so this equals action_horizon there.
+    if sync_execution:
+        exec_h = (
+            config.execute_horizon
+            or n1_policy.server_execute_horizon
+            or config.action_horizon
+        )
+        exec_h = max(1, min(int(exec_h), config.action_horizon))
+    else:
+        exec_h = config.action_horizon
     if sync_execution:
         print_green(
-            "Execution: SYNC — re-infer when the chunk is exhausted, hold the last "
-            "action during inference, start each chunk at index 0 (--rate ignored)."
+            f"Execution: SYNC — execute {exec_h} of {config.action_horizon} actions per "
+            "chunk, hold the last during inference, restart at index 0 (--rate ignored)."
         )
     else:
         print_green(
@@ -967,17 +996,18 @@ def main(config: InferenceConfig):
 
             worker_is_busy = inference_busy_event.is_set()
             if sync_execution:
-                # Query on the tick that sends the chunk's last action (or when
-                # nothing is cached). While the server thinks, the clamp below
-                # keeps re-sending that last action. `result_queue.empty()`
-                # closes the race where the worker finished after this tick's
-                # consume step: without it we would query twice.
+                # Query on the tick that sends the chunk's last EXECUTED action (or
+                # when nothing is cached). exec_h may be < action_horizon (execute a
+                # prefix of a longer prediction, then replan). While the server
+                # thinks, the clamp below keeps re-sending that action.
+                # `result_queue.empty()` closes the race where the worker finished
+                # after this tick's consume step: without it we would query twice.
                 should_start = (
                     (not worker_is_busy)
                     and result_queue.empty()
                     and (
                         cached_action_chunk is None
-                        or action_chunk_index >= config.action_horizon - 1
+                        or action_chunk_index >= exec_h - 1
                     )
                 )
             else:
@@ -1061,7 +1091,11 @@ def main(config: InferenceConfig):
                             f"token shape: {motion_token.shape}"
                         )
 
-                action_chunk_index = min(action_chunk_index + 1, config.action_horizon - 1)
+                # Clamp at exec_h-1: in sync this parks the index on the last EXECUTED
+                # action (holding it while inference runs, never advancing into the
+                # unexecuted tail of a longer prediction); in async exec_h ==
+                # action_horizon, so this is the usual full-chunk clamp.
+                action_chunk_index = min(action_chunk_index + 1, exec_h - 1)
 
             end_time = time.monotonic()
 
