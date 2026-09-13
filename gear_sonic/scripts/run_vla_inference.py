@@ -893,7 +893,19 @@ def main(config: InferenceConfig):
             zmq_frame_counter = 0
             cached_action_chunk = None
             action_chunk_index = 0
-            print("Cleared cached action chunk, reset frame counter")
+            # Flush queued/finished inference so a chunk computed from the PRE-init
+            # observation can never be executed after we've moved to the init pose.
+            # Runs AFTER the blend above, so an in-flight inference (~0.4 s) has
+            # already landed and is caught here. (A result that lands even later —
+            # inference slower than the blend, or blend disabled — is the residual
+            # case a generation guard would close.)
+            for _q in (result_queue, inference_queue):
+                try:
+                    while True:
+                        _q.get_nowait()
+                except queue.Empty:
+                    pass
+            print("Cleared cached action chunk + drained inference queues, reset frame counter")
         elif key == "p":
             pause_loop = not pause_loop
             print(f"{'Paused' if pause_loop else 'Resumed'} policy loop")
@@ -908,8 +920,17 @@ def main(config: InferenceConfig):
                 # ~0.4 s this takes). Observed on hardware 2026-07-28.
                 cached_action_chunk = None
                 action_chunk_index = 0
-                print("Policy loop resumed - cleared stale chunk, inferring fresh "
-                      "from current pose (brief hold)")
+                # Also drain the queues: clearing the pointer alone left a stale
+                # finished chunk (or a pending trigger) that the next tick would
+                # consume — the cause of the "jumps back to the pre-pause pose" bug.
+                for _q in (result_queue, inference_queue):
+                    try:
+                        while True:
+                            _q.get_nowait()
+                    except queue.Empty:
+                        pass
+                print("Policy loop resumed - cleared + drained stale chunk, inferring "
+                      "fresh from current pose (brief hold)")
         elif key == "k":
             if cpp_loop_running:
                 current_planner = cpp_mode == "PLANNER"
