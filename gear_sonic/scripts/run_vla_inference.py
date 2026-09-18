@@ -186,7 +186,13 @@ class RealsenseZMQSubscriber:
 
     def _recv_frame(self):
         msg = self._sock.recv_pyobj()
-        bgr = np.asarray(msg["image"])          # (H, W, 3) BGR uint8
+        if msg.get("image") is not None:
+            bgr = np.asarray(msg["image"])      # (H, W, 3) BGR uint8 (raw wire format, the default)
+        else:
+            # JPEG wire format ({"jpeg": bytes}; camera config jpeg: true, used over
+            # Wi-Fi). cv2 is imported lazily so the raw path never requires OpenCV.
+            import cv2
+            bgr = cv2.imdecode(np.frombuffer(msg["jpeg"], np.uint8), cv2.IMREAD_COLOR)
         rgb = np.ascontiguousarray(bgr[:, :, ::-1])
         return msg.get("timestamp", time.time()), rgb
 
