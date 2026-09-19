@@ -15,7 +15,9 @@ selected by the server, and the client adapts to it via the metadata handshake.
 Keyboard commands (received via ZMQ from the standalone keyboard publisher):
   p  -> pause / resume the policy loop
   k  -> start / stop the C++ control loop
-  i  -> blend smoothly to initial pose (or snap if no prior token) and switch to POSE mode
+  i  -> blend smoothly to initial pose (or snap if no prior token), switch to POSE mode,
+        and clear the client's episode state: cached chunk, inference queues and the
+        camera frame-history buffer (so the next plan sees only post-init frames)
   t  -> change prompt at runtime (publisher sends ``prompt:<text>``)
   [  -> toggle left hand open/closed for initial pose
   ]  -> toggle right hand open/closed for initial pose
@@ -206,6 +208,21 @@ class RealsenseZMQSubscriber:
                 self._buf.append((ts, rgb))
                 while self._buf and now - self._buf[0][0] > self._keep_s:
                     self._buf.popleft()
+
+    def clear_history(self):
+        """Drop every buffered frame (episode boundary, e.g. the 'i' re-init).
+
+        The buffer is time-anchored, so after an init-pose move it still holds
+        frames from BEFORE and DURING the move: the next stack would mix them with
+        post-init frames and the policy plans a correction for a pose the robot has
+        already left (the sudden jump after `p i p`). Clearing gives the next stack
+        episode-start semantics instead — `_history_stack` repeats the oldest frame
+        while the buffer is short, exactly what the training loader does at the
+        start of an episode. No-op when the server asked for a single frame (no
+        buffer, no capture thread).
+        """
+        with self._lock:
+            self._buf.clear()
 
     def _history_stack(self):
         """(T, H, W, 3) oldest->newest, nearest buffered frame to each target time,
@@ -911,7 +928,17 @@ def main(config: InferenceConfig):
                         _q.get_nowait()
                 except queue.Empty:
                     pass
-            print("Cleared cached action chunk + drained inference queues, reset frame counter")
+            # Same flush for the IMAGE side: the camera subscriber's frame-history
+            # buffer (servers with video_history > 1, e.g. qwenpi 3 @ 1 s) still holds
+            # frames from before/during the blend. Leaving them in makes the first
+            # post-init stack a pre/post-init mix — the policy then corrects for a pose
+            # the robot has already left (sudden jump after `p i p`). Clearing here,
+            # not on resume: the blend (~1 s) refills the buffer with post-init frames
+            # before the operator presses 'p'. No-op for single-frame servers.
+            # getattr: --sim swaps in ComposedCameraClientSensor, which has no history.
+            getattr(camera_subscriber, "clear_history", lambda: None)()
+            print("Cleared cached action chunk + drained inference queues + frame history, "
+                  "reset frame counter")
         elif key == "p":
             pause_loop = not pause_loop
             print(f"{'Paused' if pause_loop else 'Resumed'} policy loop")
